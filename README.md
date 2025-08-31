@@ -25,6 +25,58 @@ docker run -d \
   ghcr.io/xxxbrian/raycast2api:latest
 ```
 
+<details>
+<summary><b>Kubernetes Deployment</b></summary>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raycast2api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: raycast2api
+  template:
+    metadata:
+      labels:
+        app: raycast2api
+    spec:
+      containers:
+      - name: raycast2api
+        image: ghcr.io/xxxbrian/raycast2api:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: RAYCAST_BEARER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: raycast-secret
+              key: bearer-token
+        - name: RAYCAST_DEVICE_ID
+          valueFrom:
+            secretKeyRef:
+              name: raycast-secret
+              key: device-id
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: raycast-secret
+              key: api-key
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 30
+</code></pre>
+</details>
+
 ### Local Binary Deployment
 
 Download the latest release from [Releases](https://github.com/xxxbrian/raycast2api/releases) and run it.
@@ -57,9 +109,10 @@ Deployed API URL: `https://your-worker.your-account.workers.dev/`
 
 ### Available Endpoints
 
-- `GET /v1/models` - Get model list
-- `POST /v1/chat/completions` - Chat completion (OpenAI compatible)
-- `GET /health` - Health check
+- `GET /health` - Health check (liveness probe, no auth required)
+- `GET /ready` - Readiness check (readiness probe, no auth required)
+- `GET /v1/models` - Get model list (requires auth if API_KEY is set)
+- `POST /v1/chat/completions` - Chat completion (OpenAI compatible, requires auth if API_KEY is set)
 
 ## V2 Authentication
 
