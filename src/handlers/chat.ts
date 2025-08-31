@@ -1,12 +1,12 @@
-import type { Context } from 'hono';
-import { env } from 'hono/adapter';
+import type { Context } from "hono";
+import { env } from "hono/adapter";
 import type {
   Env,
   OpenAIChatRequest,
   RaycastChatRequest,
   OpenAIChatResponse,
   RaycastSSEData,
-} from '../types';
+} from "../types";
 import {
   fetchModels,
   getProviderInfo,
@@ -15,13 +15,14 @@ import {
   parseSSEResponse,
   createErrorResponse,
   generateUUID,
-} from '../utils';
-import { RAYCAST_API_URL, DEFAULT_MODEL_ID } from '../config';
+} from "../utils";
+import { RAYCAST_API_URL, DEFAULT_MODEL_ID } from "../config";
+import { backendState } from "../index";
 
 export async function handleChatCompletions(c: Context): Promise<Response> {
   try {
     const envVars = env<Env>(c);
-    const body = await c.req.json() as OpenAIChatRequest;
+    const body = (await c.req.json()) as OpenAIChatRequest;
 
     const {
       messages,
@@ -34,22 +35,33 @@ export async function handleChatCompletions(c: Context): Promise<Response> {
       return createErrorResponse(
         "Missing or invalid 'messages' field",
         400,
-        "invalid_request_error"
+        "invalid_request_error",
       );
     }
 
     const models = await fetchModels(envVars);
     if (models.size === 0) {
+      backendState.isWorking = false;
+      backendState.lastFailureTime = Date.now();
       return createErrorResponse(
         "No models available. Check server configuration.",
         500,
-        "server_error"
+        "server_error",
       );
     }
 
-    const { provider, model: internalModelName } = getProviderInfo(requestedModelId, models);
+    // Mark backend as working when models are successfully fetched
+    backendState.isWorking = true;
+    backendState.lastSuccessTime = Date.now();
 
-    console.log(`Relaying request for ${requestedModelId} to Raycast ${provider}/${internalModelName}`);
+    const { provider, model: internalModelName } = getProviderInfo(
+      requestedModelId,
+      models,
+    );
+
+    console.log(
+      `Relaying request for ${requestedModelId} to Raycast ${provider}/${internalModelName}`,
+    );
 
     const { raycastMessages, systemInstruction } = convertMessages(messages);
 
@@ -80,27 +92,38 @@ export async function handleChatCompletions(c: Context): Promise<Response> {
     if (!raycastResponse.ok) {
       const errorText = await raycastResponse.text();
       console.error(`Raycast API error response body: ${errorText}`);
+      backendState.isWorking = false;
+      backendState.lastFailureTime = Date.now();
       return createErrorResponse(
         `Raycast API error (${raycastResponse.status})`,
         502,
-        "bad_gateway"
+        "bad_gateway",
       );
     }
+
+    // Mark backend as working when API call succeeds
+    backendState.isWorking = true;
+    backendState.lastSuccessTime = Date.now();
 
     return stream
       ? handleStreamingResponse(raycastResponse, requestedModelId)
       : handleNonStreamingResponse(raycastResponse, requestedModelId);
   } catch (error: any) {
     console.error("Error in handleChatCompletions:", error);
+    backendState.isWorking = false;
+    backendState.lastFailureTime = Date.now();
     return createErrorResponse(
       `Chat completion failed: ${error.message}`,
       500,
-      "relay_error"
+      "relay_error",
     );
   }
 }
 
-function handleStreamingResponse(response: Response, requestedModelId: string): Response {
+function handleStreamingResponse(
+  response: Response,
+  requestedModelId: string,
+): Response {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -108,7 +131,9 @@ function handleStreamingResponse(response: Response, requestedModelId: string): 
   (async () => {
     if (!response.body) {
       console.error("No response body from Raycast for streaming.");
-      try { await writer.close(); } catch {}
+      try {
+        await writer.close();
+      } catch {}
       return;
     }
 
@@ -152,47 +177,76 @@ function handleStreamingResponse(response: Response, requestedModelId: string): 
                 {
                   index: 0,
                   delta: { content: jsonData.text || "" },
-                  finish_reason: jsonData.finish_reason === undefined ? null : jsonData.finish_reason,
+                  finish_reason:
+                    jsonData.finish_reason === undefined
+                      ? null
+                      : jsonData.finish_reason,
                 },
               ],
             };
 
             try {
-              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              await writer.write(
+                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
+              );
             } catch (writeError) {
               console.error("Failed to write to client stream:", writeError);
               aborted = true;
-              try { await writer.abort(writeError as any); } catch {}
+              try {
+                await writer.abort(writeError as any);
+              } catch {}
               streamFinished = true;
               break;
             }
 
-            if (jsonData.finish_reason !== null && jsonData.finish_reason !== undefined) {
+            if (
+              jsonData.finish_reason !== null &&
+              jsonData.finish_reason !== undefined
+            ) {
               streamFinished = true;
               break;
             }
           } catch (e) {
-            console.error("Failed to parse/process SSE chunk:", dataContent, "Error:", e);
+            console.error(
+              "Failed to parse/process SSE chunk:",
+              dataContent,
+              "Error:",
+              e,
+            );
           }
         }
       }
 
       if (!aborted) {
-        try { await writer.write(encoder.encode("data: [DONE]\n\n")); } catch (writeDoneError) {
+        try {
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+        } catch (writeDoneError) {
           console.error("Failed to write final [DONE] chunk:", writeDoneError);
           aborted = true;
-          try { await writer.abort(writeDoneError as any); } catch {}
+          try {
+            await writer.abort(writeDoneError as any);
+          } catch {}
         }
       }
     } catch (error) {
       console.error("Error processing Raycast stream:", error);
       if (!aborted) {
-        try { await writer.abort(error as any); } catch {}
+        try {
+          await writer.abort(error as any);
+        } catch {}
         aborted = true;
       }
     } finally {
-      if (!aborted) { try { await writer.close(); } catch {} }
-      try { await reader.cancel(); } catch (e) { console.error("Error cancelling reader:", e); }
+      if (!aborted) {
+        try {
+          await writer.close();
+        } catch {}
+      }
+      try {
+        await reader.cancel();
+      } catch (e) {
+        console.error("Error cancelling reader:", e);
+      }
     }
   })();
 
@@ -200,7 +254,7 @@ function handleStreamingResponse(response: Response, requestedModelId: string): 
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
       "Access-Control-Allow-Origin": "*",
     },
   });
@@ -208,7 +262,7 @@ function handleStreamingResponse(response: Response, requestedModelId: string): 
 
 async function handleNonStreamingResponse(
   response: Response,
-  requestedModelId: string
+  requestedModelId: string,
 ): Promise<Response> {
   const responseText = await response.text();
   const fullText = parseSSEResponse(responseText);
